@@ -110,6 +110,7 @@ class ParallelDraftModel:
         self.features = tuple(cfg['dflash_config']['target_layer_ids'])
         self.mask_token = cfg['dflash_config']['mask_token_id']
         self.window = cfg['sliding_window']
+        self.scan = None  # (layer, keys, queries) while the proposer picks far pages (proposers/parallel.py)
         self.cos, self.sin = frequencies(cfg, max_context + 32, self.device)
         self.weights = {name: weight.to(self.device) for name, weight in self.read_weights(snapshot, cfg).items()}
         if precision == 'fp8':
@@ -164,6 +165,8 @@ class ParallelDraftModel:
             p = f'layers.{layer}.self_attn.'
             k, v = (hidden @ self.weights[p + 'kv'].T).chunk(2, dim=-1)
             k = rms(k.view(-1, self.kv_heads, self.head_dim), self.weights[p + 'k_norm.weight'])
+            if self.scan is not None and layer == self.scan[0]:
+                self.scan[1][pages] = k  # pre-RoPE: pages are scored by content, not distance
             rotate_and_cache(k, v.view(-1, self.kv_heads, self.head_dim), positions, self.cos, self.sin, (keys, values), pages)
 
     def _prepare_conv(self, hidden, name):
@@ -189,6 +192,8 @@ class ParallelDraftModel:
             q = rms(self._linear(flat, p + 'self_attn.q_proj.weight').view(-1, self.heads, self.head_dim), self.weights[p + 'self_attn.q_norm.weight'])
             k, v = (flat @ self.weights[p + 'self_attn.kv'].T).chunk(2, dim=-1)
             k = rms(k.view(-1, self.kv_heads, self.head_dim), self.weights[p + 'self_attn.k_norm.weight'])
+            if self.scan is not None and layer == self.scan[0]:
+                self.scan[2][:q.shape[0]].copy_(q)
             q = rotate(q, positions, self.cos, self.sin)
             rotate_and_cache(k, v.view(-1, self.kv_heads, self.head_dim), positions, self.cos, self.sin, caches[layer], pages)
             attended = self.attend(q, caches[layer], attention, layer).reshape(batch, steps, self.heads * self.head_dim)

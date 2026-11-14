@@ -25,7 +25,7 @@ class ParallelGraphs:
                           pages=torch.arange(batch * s, dtype=torch.int64, device=device),
                           qo=torch.arange(0, (batch + 1) * s, s, dtype=torch.int32, device=device),
                           kv=torch.zeros(batch + 1, dtype=torch.int32, device=device),
-                          indices=torch.zeros(batch * (p.window + s), dtype=torch.int32, device=device),
+                          indices=torch.zeros(batch * (p.history_rows + s), dtype=torch.int32, device=device),
                           last=torch.ones(batch, dtype=torch.int32, device=device))
                 # each pair its own wrapper: a graph keeps the plan (and kernel) it was captured with
                 st['wrapper'] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(

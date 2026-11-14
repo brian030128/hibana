@@ -74,26 +74,39 @@ class CheckpointFeatureCache(FeatureCache):
         return self.serial
 
 
+PAGE = 64  # tokens per far page the draft can read beyond its window
+
+
 @dataclass
 class DraftState:
     slot: int
     end: int = 0
     valid: bool = True
     pending: int | None = None
+    start: int = 0  # the first position whose draft K/V the slot's ring holds
+    queries: torch.Tensor | None = None  # the scan layer's pre-RoPE block queries of the last draft
 
 
 class ParallelProposer:
+    pages = 0  # far pages per draft (HIBANA_DRAFT_PAGES)
+    scan_keys = scan_queries = None
+
     def __init__(self, model, context, k, name):
         import flashinfer
+        from hibana.engine.config import current
         if not 1 <= k <= getattr(model, 'max_depth', 15):
             raise ValueError('draft depth exceeds the checkpoint trained block size')
         self.model, self.context, self.k, self.name = model, context, k, name
         self.feedback_graphs = None
         self._feedback_enabled = False
         self.window = model.window
-        # A slot is its history ring, then the noise rows of the deepest block (the anchor, which is the last committed
-        # token, and k draft positions); a round at depth d writes and reads only the first d + 1.
-        self.pitch = self.window + k + 1
+        cfg = current()
+        self.pages = cfg.draft_pages
+        # A slot is its history ring (the window, or with far pages the latest HIBANA_DRAFT_CONTEXT tokens), then the
+        # noise rows of the deepest block (the anchor, which is the last committed token, and k draft positions); a round
+        # at depth d writes and reads only the first d + 1.
+        span = max(self.window, cfg.draft_context) if self.pages else self.window
+        self.pitch = span + k + 1
         self.free_slots = list(range(context.max_batch, 0, -1))
         served = getattr(model.target, 'target', DEFAULT_TARGET)  # the draft's target model carries the serving target
         self.cache_identity = (served.model_revision, *served.draft_pin(name), model.features, 'projected-bf16-kv-v1', self.window,
@@ -102,6 +115,13 @@ class ParallelProposer:
         shape = ((context.max_batch + 1) * self.pitch, 1, model.kv_heads, model.head_dim)
         self.caches = [(torch.empty(shape, dtype=torch.bfloat16, device=device), torch.empty(shape, dtype=torch.bfloat16, device=device))
                        for _ in range(model.layers)]
+        if self.pages:
+            if not 0 <= cfg.draft_scan_layer < model.layers:
+                raise ValueError(f"HIBANA_DRAFT_SCAN_LAYER must name one of the draft's {model.layers} layers")
+            self.scan_keys = torch.empty(shape[:1] + shape[2:], dtype=torch.bfloat16, device=device)
+            self.scan_queries = torch.empty((context.max_batch * (k + 1), model.heads, model.head_dim),
+                                            dtype=torch.bfloat16, device=device)
+            model.scan = (cfg.draft_scan_layer, self.scan_keys, self.scan_queries)
         self.features = torch.empty((context.max_batch + 1, self.window, model.hidden), dtype=torch.bfloat16, device=device)
         self.feature_cache = FeatureCache(context.max_batch * self.window * model.hidden * 2)
         # FlashInfer's split-KV scratch for the draft's attention grows with the drafted rows: 161 MB at 64 requests x 7
@@ -113,8 +133,10 @@ class ParallelProposer:
                                                                           stored_payload=True, short_drafts=True, scored_drafts=True))
         self.attention = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace, 'NHD')
         from hibana.kernels.attention_plan import AttentionGeometry, AttentionPlanner
+        # With far pages the histories carry the band themselves (pages + the window's last W - 1 tokens): FlashInfer's
+        # window_left counts KV rows, not positions, so it would hide the pages.
         self.planner = AttentionPlanner(AttentionGeometry(model.heads, model.kv_heads, model.head_dim,
-                                                          window_left=self.window - 1))
+                                                          window_left=None if self.pages else self.window - 1))
         self.graphs = None
         self.cache_hits = self.cache_fallbacks = 0
         # the pinned draft's acceptance calibration (qwen38_config.DRAFT_CALIBRATION); the raw top probability for a
@@ -129,8 +151,19 @@ class ParallelProposer:
         self.requirements = replace(self.requirements, persistent_bytes=self.bytes)
 
     @property
+    def span(self):
+        """Context positions a slot's K/V ring holds."""
+        return self.pitch - self.k - 1
+
+    @property
+    def history_rows(self):
+        """The most context rows one request's draft reads."""
+        return self.window - 1 + self.pages * PAGE if self.pages else self.window
+
+    @property
     def bytes(self):
-        tensors = [self.features, *(t for pair in self.caches for t in pair)]
+        tensors = [self.features, *(t for pair in self.caches for t in pair),
+                   *(t for t in (self.scan_keys, self.scan_queries) if t is not None)]
         feedback_bytes = self.feedback_graphs.bytes if self.feedback_graphs is not None else 0
         return (self.model.bytes + sum(t.numel() * t.element_size() for t in tensors)
                 + self.feature_cache.capacity + self.workspace.numel() + feedback_bytes)
@@ -145,10 +178,13 @@ class ParallelProposer:
         return req.proposer_state
 
     def _write(self, state, start, hidden):
+        """K/V for every row (at most a span), the projected features only for the last window of them."""
+        if start != state.end:
+            state.start = start  # what precedes `start` was never written to this ring
         positions = torch.arange(start, start + len(hidden), device=self.context.device)
-        ring = positions % self.window
-        self.features[state.slot, ring] = hidden
-        self.model.context_kv(hidden, positions, self.caches, state.slot * self.pitch + ring)
+        tail = max(0, len(hidden) - self.window)
+        self.features[state.slot, positions[tail:] % self.window] = hidden[tail:]
+        self.model.context_kv(hidden, positions, self.caches, state.slot * self.pitch + positions % self.span)
         state.end = start + len(hidden)
 
     def _save(self, req, snap):
@@ -193,9 +229,9 @@ class ParallelProposer:
         projected = self.model.project_features(result['features'])
         offset = start
         for limit in bounds:
-            # A long first prefill can exceed a sliding window. Only its last
-            # window is needed at this boundary; absolute RoPE positions stay.
-            left = max(offset, limit - self.window)
+            # A long first prefill can exceed the ring. Only its last span is
+            # needed at this boundary; absolute RoPE positions stay.
+            left = max(offset, limit - self.span)
             self._write(state, left, projected[left - start:limit - start])
             if limit in req.private:
                 self._save(req, req.private[limit])
@@ -236,16 +272,23 @@ class ParallelProposer:
         tokens = torch.full((batch, s), self.model.mask_token, device=device, dtype=torch.int64)
         tokens[:, 0] = inputs.tokens
         positions = (inputs.positions[:, None] + torch.arange(s, device=device)).reshape(-1)
-        write, histories = [], []
+        write, histories, states = [], [], []
         for req in requests:
             state = self._state(req)
             if state.end != req.committed_len or not state.valid:
                 raise ValueError('draft context is incomplete')
             base = state.slot * self.pitch
-            noise = torch.arange(base + self.window, base + self.window + s, device=device)
-            history = torch.arange(max(0, state.end - self.window), state.end, device=device) % self.window + base
+            noise = torch.arange(base + self.span, base + self.span + s, device=device)
+            if self.pages:
+                history = torch.arange(max(0, state.end - self.window + 1), state.end, device=device) % self.span + base
+                far = self._far_pages(state)
+                if far is not None:
+                    history = torch.cat([far, history])
+            else:
+                history = torch.arange(max(0, state.end - self.window), state.end, device=device) % self.window + base
             write.append(noise)
             histories.append(torch.cat([history, noise]))
+            states.append(state)
         anchor_features = None
         if getattr(self.model, 'uses_context_anchor', False):
             states = [self._state(req) for req in requests]
@@ -257,6 +300,9 @@ class ParallelProposer:
             self._plan(self.attention, histories, batch, s)
             hidden = self.model.forward(tokens, positions, torch.cat(write), self.caches, self.attention)[:, 1:]
             candidates, scores = self.select(hidden, inputs.tokens, anchor_features)
+        if self.pages:  # this draft's queries pick the next draft's pages
+            for row, state in enumerate(states):
+                state.queries = self.scan_queries[row * s:(row + 1) * s].clone()
         sampled = any(not r.params.greedy for r in requests)
         if not sampled:
             from hibana.kernels.draft_selection import greedy_lattice
@@ -276,6 +322,26 @@ class ParallelProposer:
         else:
             tokens_s, laws = sample_lattice(candidates, scores, [r.params for r in requests], [r.generator for r in requests])
         return Proposal(tokens_s, laws, candidates)  # sampled rounds verify one depth for all: no scores
+
+    def _far_pages(self, state):
+        """Ring rows of the far pages the next draft reads: the scan layer's last block queries score every held
+        context key (softmax over all of them, no RoPE), and the pages before the window with the most mass win."""
+        if state.queries is None:
+            return None
+        end = state.end
+        low = max(state.start, end - self.span)
+        first, last = -(-low // PAGE), (end - self.window + 1) // PAGE
+        if last <= first:
+            return None
+        base, model = state.slot * self.pitch, self.model
+        keys = self.scan_keys[base + torch.arange(low, end, device=self.context.device) % self.span]  # [n, kvh, hd]
+        rows, group = state.queries.shape[0], model.heads // model.kv_heads
+        q = state.queries.view(rows, model.kv_heads, group, model.head_dim).transpose(0, 1).reshape(model.kv_heads, -1, model.head_dim)
+        mass = torch.bmm(q, keys.permute(1, 2, 0)).float().mul_(model.head_dim ** -0.5).softmax(-1).sum((0, 1))
+        mass = mass[first * PAGE - low:last * PAGE - low].view(-1, PAGE).sum(-1)
+        chosen = torch.topk(mass, min(self.pages, last - first)).indices.sort().values + first
+        offsets = torch.arange(PAGE, device=chosen.device)
+        return base + (chosen[:, None] * PAGE + offsets).reshape(-1) % self.span
 
     def acceptance(self, candidates, scores, tokens):
         """Each drafted position's calibrated probability of acceptance once the positions before it were accepted
@@ -334,7 +400,7 @@ class ParallelProposer:
         hidden = self.model.project_features(layers)
         # One asynchronous upload; no GPU scalar extraction or per-row wait.
         metadata = [[pos, state.slot * self.window + pos % self.window,
-                     state.slot * self.pitch + pos % self.window]
+                     state.slot * self.pitch + pos % self.span]
                     for state, start, count in zip(states, starts, counts) for pos in range(start, start + count)]
         metadata = torch.tensor(metadata, dtype=torch.int64, pin_memory=self.context.device.type == 'cuda')
         positions, rows, pages = metadata.to(self.context.device, non_blocking=True).unbind(1)
@@ -378,9 +444,8 @@ class ParallelProposer:
         positions = starts[:, None] + offsets[None, :]
         valid = offsets[None, :] < counts[:, None]
         slot = torch.where(valid, ring_slots[:, None], torch.zeros_like(ring_slots)[:, None])
-        ring = positions % self.window
-        rows = (slot * self.window + ring).reshape(-1)
-        pages = (slot * self.pitch + ring).reshape(-1)
+        rows = (slot * self.window + positions % self.window).reshape(-1)
+        pages = (slot * self.pitch + positions % self.span).reshape(-1)
         self.features.view(-1, self.features.shape[-1])[rows] = hidden
         self.model.context_kv(hidden, positions.reshape(-1), self.caches, pages)
 

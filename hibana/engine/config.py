@@ -111,6 +111,9 @@ class EngineConfig:
     spec_step_cost: float = 0.0               # HIBANA_SPEC_STEP_COST: a drafted token's cost against a depth-1 round, for adaptive depth (engine/depth.py; 0: fixed)
     spec_policy: str = "fixed"                # HIBANA_SPEC_POLICY: fixed | budget (engine/depth.RowBudget: verified drafts from scores and measured costs)
     draft_dir: str | None = None              # HIBANA_DRAFT
+    draft_pages: int = 0                      # HIBANA_DRAFT_PAGES: far pages of 64 tokens a DFlash2 draft reads besides its window, picked by its own block queries (0: the window only)
+    draft_context: int = 32768               # HIBANA_DRAFT_CONTEXT: latest context tokens whose draft K/V each request keeps for those pages
+    draft_scan_layer: int = 3                 # HIBANA_DRAFT_SCAN_LAYER: the draft layer whose block queries pick the pages
     host_floor_gib: float = HOST_FLOOR_KIB / 2**20  # HIBANA_HOST_FLOOR_GIB: MemAvailable the pools leave for the OS and other programs; admission holds and the guard acts under half of it
     draft_vocab: int = 0                      # HIBANA_DRAFT_VOCAB: reduced MTP draft vocabulary rows (0: full)
     draft_head: str = "fp8"                   # HIBANA_DRAFT_HEAD: fp8 (the target's head), w3 or w2
@@ -194,6 +197,9 @@ class EngineConfig:
             spec_step_cost=float(_str(e, "HIBANA_SPEC_STEP_COST") or 0.0),
             spec_policy=_str(e, "HIBANA_SPEC_POLICY", "fixed"),
             draft_dir=_str(e, "HIBANA_DRAFT"),
+            draft_pages=_int(e, "HIBANA_DRAFT_PAGES", 0),
+            draft_context=_int(e, "HIBANA_DRAFT_CONTEXT", 32768),
+            draft_scan_layer=_int(e, "HIBANA_DRAFT_SCAN_LAYER", 3),
             host_floor_gib=floor_kib(e) / 2**20,
             draft_vocab=_int(e, "HIBANA_DRAFT_VOCAB", 0),
             draft_head=_str(e, "HIBANA_DRAFT_HEAD", "fp8"),

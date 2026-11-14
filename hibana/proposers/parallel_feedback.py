@@ -29,9 +29,8 @@ class FeedbackGraphs:
             def forward():
                 hidden = p.model.project_features({lid: rows[:count] for lid, rows in self.features.items()})
                 positions = steps + self.metadata[0]
-                ring = positions % p.window
-                rows = self.metadata[1] * p.window + ring
-                pages = self.metadata[1] * p.pitch + ring
+                rows = self.metadata[1] * p.window + positions % p.window
+                pages = self.metadata[1] * p.pitch + positions % (p.pitch - p.k - 1)  # the K/V ring's span
                 p.features.view(-1, p.model.hidden)[rows] = hidden
                 p.model.context_kv(hidden, positions, p.caches, pages)
 
